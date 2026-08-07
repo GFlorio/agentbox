@@ -29,18 +29,14 @@ RUN apt-get update \
         software-properties-common \
         unzip \
         xz-utils \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/agent \
+    && chown "${USER_ID}" /home/agent
 
 RUN npm install --global "opencode-ai@${OPENCODE_VERSION}" \
     && npm cache clean --force
 
 COPY opencode.json /etc/opencode/opencode.json
-
-RUN if ! getent group "${GROUP_ID}" >/dev/null; then \
-        groupadd --gid "${GROUP_ID}" agent; \
-    fi \
-    && useradd --create-home --uid "${USER_ID}" \
-        --gid "${GROUP_ID}" --shell /bin/bash agent
 
 ENV HOME=/home/agent
 ENV XDG_CACHE_HOME=/home/agent/.cache
@@ -49,6 +45,6 @@ ENV XDG_DATA_HOME=/home/agent/.local/share
 ENV XDG_STATE_HOME=/home/agent/.local/state
 
 WORKDIR /workspace
-USER agent
+USER ${USER_ID}:${GROUP_ID}
 
 CMD ["opencode", "/workspace"]
