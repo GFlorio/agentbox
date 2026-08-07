@@ -36,6 +36,9 @@ RUN apt-get update \
 RUN npm install --global "opencode-ai@${OPENCODE_VERSION}" \
     && npm cache clean --force
 
+RUN mkdir -p /tmp/opencode \
+    && chown "${USER_ID}" /tmp/opencode
+
 COPY opencode.json /etc/opencode/opencode.json
 
 ENV HOME=/home/agent
