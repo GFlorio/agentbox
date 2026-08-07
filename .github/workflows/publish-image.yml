@@ -1,0 +1,51 @@
+name: publish-image
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+    paths:
+      - Containerfile
+      - opencode.json
+      - .github/workflows/publish-image.yml
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Generate image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: agentbox
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref_type == 'branch' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build image
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: agentbox
+          tags: ${{ steps.meta.outputs.tags }}
+          containerfiles: ./Containerfile
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Default agentbox development image
+
+      - name: Push to GHCR
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: agentbox
+          tags: ${{ steps.meta.outputs.tags }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}

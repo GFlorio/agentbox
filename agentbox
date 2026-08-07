@@ -1,0 +1,963 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import subprocess
+import sys
+import tarfile
+
+
+CONTAINERFILE = "Containerfile.dev"
+DEFAULT_IMAGE = os.environ.get(
+    "AGENTBOX_DEFAULT_IMAGE",
+    "ghcr.io/gflorio/agentbox:latest",
+)
+WORKSPACE_PATH = "/workspace"
+AGENT_HOME = "/home/agent"
+IMAGE_HASH_LABEL = "dev.agentbox.containerfile-sha256"
+
+
+class AgentboxError(RuntimeError):
+    """Expected agentbox failure with a user-facing error message."""
+
+
+def run(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    capture: bool = False,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=cwd,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
+
+
+def require_command(name: str) -> None:
+    if shutil.which(name) is None:
+        raise AgentboxError(f"Required command not found: {name}")
+
+
+def find_project_root(start: Path) -> Path:
+    result = run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=start,
+        capture=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        raise AgentboxError(f"Not inside a Git working tree: {start}")
+
+    return Path(result.stdout.strip()).resolve()
+
+
+def project_key(root: Path) -> str:
+    path_digest = hashlib.sha256(
+        str(root).encode("utf-8")
+    ).hexdigest()[:10]
+
+    safe_name = "".join(
+        character if character.isalnum() else "-"
+        for character in root.name.lower()
+    ).strip("-")
+
+    return f"{safe_name}-{path_digest}"
+
+
+def containerfile_path(root: Path) -> Path | None:
+    path = root / CONTAINERFILE
+    return path if path.is_file() else None
+
+
+def image_name(root: Path) -> str:
+    if containerfile_path(root) is not None:
+        return f"localhost/agentbox-{project_key(root)}:dev"
+    return DEFAULT_IMAGE
+
+
+def home_volume_name(root: Path) -> str:
+    return f"agentbox-{project_key(root)}-home"
+
+
+def container_name(root: Path, kind: str, session: str) -> str:
+    return f"agentbox-{project_key(root)}-{kind}-{session}"
+
+
+def state_root(root: Path) -> Path:
+    default_state_home = Path.home() / ".local" / "state"
+    xdg_state_home = Path(
+        os.environ.get("XDG_STATE_HOME", default_state_home)
+    )
+
+    return xdg_state_home / "agentbox" / project_key(root)
+
+
+def containerfile_hash(root: Path) -> str:
+    containerfile = root / CONTAINERFILE
+
+    return hashlib.sha256(
+        containerfile.read_bytes()
+    ).hexdigest()
+
+
+def image_exists(name: str) -> bool:
+    result = run(
+        ["podman", "image", "exists", name],
+        check=False,
+    )
+
+    return result.returncode == 0
+
+
+def image_containerfile_hash(name: str) -> str | None:
+    result = run(
+        [
+            "podman",
+            "image",
+            "inspect",
+            name,
+            "--format",
+            f'{{{{ index .Labels "{IMAGE_HASH_LABEL}" }}}}',
+        ],
+        capture=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        return None
+
+    value = result.stdout.strip()
+
+    if not value or value == "<no value>":
+        return None
+
+    return value
+
+
+def build_image(
+    root: Path,
+    *,
+    no_cache: bool = False,
+) -> None:
+    containerfile = containerfile_path(root)
+
+    if containerfile is None:
+        raise AgentboxError(
+            f"{root} does not contain {CONTAINERFILE}"
+        )
+
+    uid = os.getuid()
+    gid = os.getgid()
+    digest = containerfile_hash(root)
+    name = image_name(root)
+
+    command = [
+        "podman",
+        "build",
+        "--tag",
+        name,
+        "--label",
+        f"{IMAGE_HASH_LABEL}={digest}",
+        "--build-arg",
+        f"USER_ID={uid}",
+        "--build-arg",
+        f"GROUP_ID={gid}",
+        "--file",
+        str(containerfile),
+    ]
+
+    if no_cache:
+        command.extend(
+            [
+                "--no-cache",
+                "--pull=always",
+            ]
+        )
+
+    command.append(str(root))
+
+    print(f"Building {name}...")
+
+    result = subprocess.run(
+        command,
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    if result.returncode != 0:
+        if result.stdout:
+            print(result.stdout, file=sys.stderr, end="")
+
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            command,
+            output=result.stdout,
+        )
+
+    print("Development image ready.")
+
+
+def pull_default_image(*, refresh: bool = False) -> None:
+    if not refresh and image_exists(DEFAULT_IMAGE):
+        return
+
+    print(f"Pulling {DEFAULT_IMAGE}...")
+    run(["podman", "pull", DEFAULT_IMAGE])
+
+
+def ensure_image(
+    root: Path,
+    *,
+    rebuild: bool = False,
+) -> None:
+    if containerfile_path(root) is None:
+        pull_default_image(refresh=rebuild)
+        return
+
+    name = image_name(root)
+
+    if rebuild:
+        build_image(root)
+        return
+
+    if not image_exists(name):
+        build_image(root)
+        return
+
+    expected_hash = containerfile_hash(root)
+    actual_hash = image_containerfile_hash(name)
+
+    if actual_hash != expected_hash:
+        print(
+            f"{CONTAINERFILE} changed; "
+            "rebuilding development image."
+        )
+        build_image(root)
+
+
+def session_suffix() -> str:
+    timestamp = datetime.now(timezone.utc).strftime(
+        "%y%m%d%H%M%S"
+    )
+
+    return f"{timestamp}-{secrets.token_hex(3)}"
+
+
+def validate_session_name(value: str) -> str:
+    allowed = set(
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+    )
+
+    if (
+        not value
+        or not value[0].isalnum()
+        or any(character not in allowed for character in value)
+    ):
+        raise AgentboxError(
+            "--name must start with a letter or digit and "
+            "contain only letters, digits, '.', '_' or '-'"
+        )
+
+    return value
+
+
+def git_output(
+    root: Path,
+    arguments: list[str],
+) -> str:
+    result = run(
+        ["git", *arguments],
+        cwd=root,
+        capture=True,
+    )
+
+    return result.stdout
+
+
+def create_recovery_snapshot(root: Path) -> Path:
+    """
+    Save recoverable host-side Git state outside the mounted workspace.
+
+    The container cannot access or delete this snapshot. Ignored files are
+    intentionally excluded.
+    """
+
+    timestamp = datetime.now(timezone.utc).strftime(
+        "%Y%m%dT%H%M%SZ"
+    )
+
+    base_destination = (
+        state_root(root)
+        / "snapshots"
+        / timestamp
+    )
+
+    destination = base_destination
+    suffix = 1
+
+    while destination.exists():
+        destination = Path(f"{base_destination}-{suffix}")
+        suffix += 1
+
+    destination.mkdir(parents=True, exist_ok=False)
+
+    head = git_output(
+        root,
+        ["rev-parse", "HEAD"],
+    ).strip()
+
+    (destination / "head.txt").write_text(
+        head + "\n",
+        encoding="utf-8",
+    )
+
+    status = git_output(
+        root,
+        [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+    )
+
+    (destination / "status.txt").write_text(
+        status,
+        encoding="utf-8",
+    )
+
+    working_tree_diff = git_output(
+        root,
+        [
+            "diff",
+            "--binary",
+            "HEAD",
+        ],
+    )
+
+    (destination / "working-tree.patch").write_text(
+        working_tree_diff,
+        encoding="utf-8",
+    )
+
+    untracked_result = run(
+        [
+            "git",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+        cwd=root,
+        capture=True,
+    )
+
+    untracked_paths = [
+        Path(item)
+        for item in untracked_result.stdout.split("\0")
+        if item
+    ]
+
+    if untracked_paths:
+        archive_path = destination / "untracked.tar.gz"
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            for relative_path in untracked_paths:
+                absolute_path = root / relative_path
+
+                # Files may disappear between Git enumeration and archiving.
+                if (
+                    absolute_path.exists()
+                    or absolute_path.is_symlink()
+                ):
+                    archive.add(
+                        absolute_path,
+                        arcname=relative_path,
+                        recursive=True,
+                    )
+
+    print(f"Recovery snapshot: {destination}")
+
+    return destination
+
+
+def podman_run_command(
+    root: Path,
+    container_command: list[str],
+    *,
+    kind: str,
+    session: str,
+    network: str,
+) -> list[str]:
+    uid = os.getuid()
+    gid = os.getgid()
+
+    runtime_dir = f"/run/user/{uid}"
+
+    command = [
+        "podman",
+        "run",
+        "--rm",
+        "--interactive",
+        "--tty",
+        "--init",
+        "--name",
+        container_name(root, kind, session),
+        "--hostname",
+        f"agentbox-{root.name}",
+        "--userns",
+        "keep-id",
+        "--user",
+        f"{uid}:{gid}",
+        "--read-only",
+        "--cap-drop",
+        "all",
+        "--security-opt",
+        "no-new-privileges",
+        "--memory",
+        os.environ.get("AGENTBOX_MEMORY", "12g"),
+        "--cpus",
+        os.environ.get("AGENTBOX_CPUS", "8"),
+        "--network",
+        network,
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,size=2g,mode=1777",
+        "--tmpfs",
+        f"{runtime_dir}:rw,nosuid,nodev,size=64m,mode=0700",
+        "--volume",
+        f"{root}:{WORKSPACE_PATH}:rw,Z",
+        "--volume",
+        f"{home_volume_name(root)}:{AGENT_HOME}:rw,U",
+        "--env",
+        f"XDG_RUNTIME_DIR={runtime_dir}",
+    ]
+
+    command.append(image_name(root))
+    command.extend(container_command)
+
+    return command
+
+
+def start_container(
+    root: Path,
+    container_command: list[str],
+    *,
+    kind: str,
+    session: str,
+    network: str = "slirp4netns",
+) -> None:
+    command = podman_run_command(
+        root,
+        container_command,
+        kind=kind,
+        session=session,
+        network=network,
+    )
+
+    run(command, cwd=root)
+
+
+def command_run(
+    args: argparse.Namespace,
+    root: Path,
+) -> None:
+    ensure_image(
+        root,
+        rebuild=args.rebuild,
+    )
+
+    if not args.no_snapshot:
+        create_recovery_snapshot(root)
+
+    opencode_command = [
+        "opencode",
+        "--auto",
+        WORKSPACE_PATH,
+    ]
+
+    opencode_command.extend(args.opencode_args)
+
+    start_container(
+        root,
+        opencode_command,
+        kind="opencode",
+        session=args.name or session_suffix(),
+        network=args.network,
+    )
+
+
+def command_shell(
+    args: argparse.Namespace,
+    root: Path,
+) -> None:
+    ensure_image(
+        root,
+        rebuild=args.rebuild,
+    )
+
+    if not args.no_snapshot:
+        create_recovery_snapshot(root)
+
+    start_container(
+        root,
+        ["bash", "-l"],
+        kind="shell",
+        session=args.name or session_suffix(),
+        network=args.network,
+    )
+
+
+def command_auth(
+    args: argparse.Namespace,
+    root: Path,
+) -> None:
+    ensure_image(
+        root,
+        rebuild=args.rebuild,
+    )
+
+    start_container(
+        root,
+        [
+            "opencode",
+            "auth",
+            "login",
+        ],
+        kind="auth",
+        session=args.name or session_suffix(),
+        network=args.network,
+    )
+
+
+def command_build(
+    args: argparse.Namespace,
+    root: Path,
+) -> None:
+    if containerfile_path(root) is None:
+        pull_default_image(refresh=args.no_cache)
+        return
+
+    build_image(
+        root,
+        no_cache=args.no_cache,
+    )
+
+
+def command_status(
+    _args: argparse.Namespace,
+    root: Path,
+) -> None:
+    prefix = f"agentbox-{project_key(root)}"
+
+    result = run(
+        [
+            "podman",
+            "ps",
+            "--all",
+            "--filter",
+            f"name={prefix}",
+            "--format",
+            "table {{.Names}}\t{{.Status}}\t{{.Image}}",
+        ],
+        capture=True,
+        check=False,
+    )
+
+    if result.returncode == 0 and result.stdout.strip():
+        print(result.stdout, end="")
+    else:
+        print(f"No containers for this project: {prefix}")
+
+
+def project_containers(root: Path) -> list[str]:
+    prefix = f"agentbox-{project_key(root)}"
+
+    result = run(
+        [
+            "podman",
+            "ps",
+            "--all",
+            "--format",
+            "{{.Names}}",
+        ],
+        capture=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        return []
+
+    return [
+        name
+        for name in result.stdout.splitlines()
+        if name.startswith(prefix)
+    ]
+
+
+def project_images(root: Path) -> list[str]:
+    repo_prefix = f"localhost/agentbox-{project_key(root)}"
+
+    result = run(
+        [
+            "podman",
+            "images",
+            "--all",
+            "--format",
+            "json",
+        ],
+        capture=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        return []
+
+    try:
+        entries = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    matches: list[str] = []
+
+    for entry in entries:
+        names = (
+            entry.get("Names")
+            or entry.get("names")
+            or entry.get("RepoTags")
+            or entry.get("repoTags")
+            or []
+        )
+
+        if not any(
+            name == repo_prefix
+            or name.startswith(f"{repo_prefix}:")
+            for name in names
+        ):
+            continue
+
+        image_id = (
+            entry.get("ID")
+            or entry.get("id")
+        )
+
+        if image_id and image_id not in matches:
+            matches.append(image_id)
+
+    return matches
+
+
+def volume_exists(name: str) -> bool:
+    result = run(
+        ["podman", "volume", "exists", name],
+        check=False,
+    )
+
+    return result.returncode == 0
+
+
+def command_clean(
+    args: argparse.Namespace,
+    root: Path,
+) -> None:
+    containers = project_containers(root)
+    images = project_images(root)
+    volume = home_volume_name(root)
+
+    if not containers and not images and not volume_exists(volume):
+        print("Nothing to clean for this project.")
+        return
+
+    details = []
+
+    if containers:
+        details.append(
+            f"{len(containers)} container(s): "
+            + ", ".join(containers)
+        )
+
+    if images:
+        details.append(
+            f"{len(images)} image(s): "
+            + ", ".join(images)
+        )
+
+    if volume_exists(volume):
+        details.append(f"volume: {volume}")
+
+    print("Will remove:")
+    for detail in details:
+        print(f"  {detail}")
+
+    if not args.yes:
+        answer = input("Continue? [y/N] ").strip().lower()
+
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return
+
+    for name in containers:
+        run(
+            [
+                "podman",
+                "rm",
+                "--force",
+                name,
+            ],
+            check=False,
+        )
+
+    for image_id in images:
+        run(
+            [
+                "podman",
+                "image",
+                "rm",
+                "--force",
+                image_id,
+            ],
+            check=False,
+        )
+
+    run(
+        [
+            "podman",
+            "volume",
+            "rm",
+            "--force",
+            volume,
+        ],
+        check=False,
+    )
+
+    print(
+        "Removed project containers, images, "
+        "and persistent agent home."
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agentbox",
+        description=(
+            "Run a repository coding agent inside "
+            "a rootless Podman sandbox."
+        ),
+    )
+
+    parser.add_argument(
+        "--project",
+        type=Path,
+        default=Path.cwd(),
+        help=(
+            "Path inside the project. "
+            "Defaults to the current directory."
+        ),
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command",
+    )
+
+    common = argparse.ArgumentParser(
+        add_help=False,
+    )
+
+    common.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Force an image build before starting.",
+    )
+
+    common.add_argument(
+        "--no-snapshot",
+        action="store_true",
+        help=(
+            "Do not save a pre-session Git "
+            "recovery snapshot."
+        ),
+    )
+
+    common.add_argument(
+        "--name",
+        type=validate_session_name,
+        help=(
+            "Session name for the container. "
+            "Defaults to a unique value; use it to "
+            "start multiple containers side by side."
+        ),
+    )
+
+    common.add_argument(
+        "--network",
+        default="slirp4netns",
+        help=(
+            "Podman network mode. "
+            "Defaults to slirp4netns."
+        ),
+    )
+
+    run_parser = subparsers.add_parser(
+        "run",
+        parents=[common],
+        help="Start OpenCode.",
+    )
+
+    run_parser.add_argument(
+        "opencode_args",
+        nargs=argparse.REMAINDER,
+        help=(
+            "Arguments after '--' are passed "
+            "directly to OpenCode."
+        ),
+    )
+
+    subparsers.add_parser(
+        "shell",
+        parents=[common],
+        help="Open a shell in the development container.",
+    )
+
+    auth_parser = subparsers.add_parser(
+        "auth",
+        parents=[common],
+        help=(
+            "Authenticate OpenCode in the "
+            "persistent project home."
+        ),
+    )
+
+    auth_parser.set_defaults(
+        no_snapshot=True,
+    )
+
+    build_subparser = subparsers.add_parser(
+        "build",
+        help="Build the development image.",
+    )
+
+    build_subparser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help=(
+            "Disable the build cache and refresh "
+            "the base image."
+        ),
+    )
+
+    subparsers.add_parser(
+        "status",
+        help=(
+            "List the project's containers "
+            "and their status."
+        ),
+    )
+
+    clean_parser = subparsers.add_parser(
+        "clean",
+        help=(
+            "Delete the project's containers, images, "
+            "and persistent agent home."
+        ),
+    )
+
+    clean_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help=(
+            "Remove without prompting for "
+            "confirmation."
+        ),
+    )
+
+    return parser
+
+
+def apply_default_run_arguments(
+    args: argparse.Namespace,
+) -> None:
+    args.command = "run"
+    args.rebuild = False
+    args.no_snapshot = False
+    args.name = None
+    args.network = "slirp4netns"
+    args.opencode_args = []
+
+
+def main() -> int:
+    try:
+        require_command("git")
+        require_command("podman")
+
+        parser = build_parser()
+        args = parser.parse_args()
+
+        if args.command is None:
+            apply_default_run_arguments(args)
+
+        root = find_project_root(
+            args.project.expanduser().resolve()
+        )
+
+        if args.command == "run":
+            command_run(args, root)
+        elif args.command == "shell":
+            command_shell(args, root)
+        elif args.command == "auth":
+            command_auth(args, root)
+        elif args.command == "build":
+            command_build(args, root)
+        elif args.command == "status":
+            command_status(args, root)
+        elif args.command == "clean":
+            command_clean(args, root)
+        else:
+            parser.error(
+                f"Unknown command: {args.command}"
+            )
+
+        return 0
+
+    except AgentboxError as error:
+        print(
+            f"agentbox: {error}",
+            file=sys.stderr,
+        )
+        return 1
+
+    except subprocess.CalledProcessError as error:
+        print(
+            (
+                "agentbox: command failed with "
+                f"exit code {error.returncode}"
+            ),
+            file=sys.stderr,
+        )
+        return error.returncode
+
+    except KeyboardInterrupt:
+        print(
+            "\nagentbox: interrupted",
+            file=sys.stderr,
+        )
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
