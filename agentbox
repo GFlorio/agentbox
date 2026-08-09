@@ -409,6 +409,7 @@ def podman_run_command(
     gid = os.getgid()
 
     runtime_dir = f"/run/user/{uid}"
+    agents_dir = Path.home() / ".agents"
 
     command = [
         "podman",
@@ -430,8 +431,8 @@ def podman_run_command(
         "all",
         "--security-opt",
         "no-new-privileges",
-        "--memory",
-        os.environ.get("AGENTBOX_MEMORY", "12g"),
+        # "--memory",
+        # os.environ.get("AGENTBOX_MEMORY", "12g"),
         "--cpus",
         os.environ.get("AGENTBOX_CPUS", "8"),
         "--network",
@@ -447,6 +448,14 @@ def podman_run_command(
         "--env",
         f"XDG_RUNTIME_DIR={runtime_dir}",
     ]
+
+    if agents_dir.is_dir():
+        command.extend(
+            [
+                "--volume",
+                f"{agents_dir}:{AGENT_HOME}/.agents:ro,Z",
+            ]
+        )
 
     command.append(image_name(root))
     command.extend(container_command)
