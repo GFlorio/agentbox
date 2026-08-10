@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -23,10 +26,55 @@ DEFAULT_IMAGE = os.environ.get(
 WORKSPACE_PATH = "/workspace"
 AGENT_HOME = "/home/agent"
 IMAGE_HASH_LABEL = "dev.agentbox.containerfile-sha256"
+PROJECT_PATH_LABEL = "dev.agentbox.project-path"
+
+RESOURCE_PREFIX = "agentbox-"
+IMAGE_PREFIX = "localhost/agentbox-"
+
+# OpenCode keeps credentials in its data directory and the selected model in
+# its state directory. Both are shared by every project so that a single
+# `agentbox auth` covers all worktrees.
+SHARED_DATA_VOLUME = "agentbox-shared-data"
+SHARED_STATE_VOLUME = "agentbox-shared-state"
+SHARED_VOLUMES = (SHARED_DATA_VOLUME, SHARED_STATE_VOLUME)
+
+OPENCODE_DATA_PATH = f"{AGENT_HOME}/.local/share/opencode"
+OPENCODE_STATE_PATH = f"{AGENT_HOME}/.local/state/opencode"
+
+# The credential is shared through a neutral mount point rather than by
+# mounting over the data directory, which would also share opencode.db and
+# make session history common to every worktree.
+SHARED_DATA_PATH = f"{AGENT_HOME}/.agentbox/shared"
+SHARED_CREDENTIAL = "auth.json"
+
+SHARED_VOLUME_MOUNTS = (
+    (SHARED_DATA_VOLUME, SHARED_DATA_PATH),
+    (SHARED_STATE_VOLUME, OPENCODE_STATE_PATH),
+)
+
+GLOBAL_CONFIG_PATH = f"{AGENT_HOME}/.config/opencode"
+
+# The box ships its own opencode.json; the host copy must not override it.
+GLOBAL_CONFIG_EXCLUDED = frozenset({"opencode.jsonc"})
+
+# Kept alongside the mounted subdirectories because it is OpenCode's manifest
+# of npm-installed global plugins.
+GLOBAL_CONFIG_FILES = frozenset({"package.json"})
 
 
 class AgentboxError(RuntimeError):
     """Expected agentbox failure with a user-facing error message."""
+
+
+@dataclass(frozen=True)
+class Resource:
+    """A podman container, volume, or image created by agentbox."""
+
+    kind: str
+    name: str
+    identifier: str
+    project_path: str | None
+    shared: bool = False
 
 
 def run(
@@ -172,6 +220,8 @@ def build_image(
         name,
         "--label",
         f"{IMAGE_HASH_LABEL}={digest}",
+        "--label",
+        f"{PROJECT_PATH_LABEL}={root}",
         "--build-arg",
         f"USER_ID={uid}",
         "--build-arg",
@@ -449,6 +499,58 @@ def create_recovery_snapshot(root: Path) -> Path:
     return destination
 
 
+def global_config_mounts(source: Path) -> list[tuple[Path, str]]:
+    """
+    Host paths under ~/.config/opencode to expose read-only in the box.
+
+    Every subdirectory is mounted, so global agents, skills, plugins, commands,
+    and themes work without agentbox knowing OpenCode's directory names.
+    """
+
+    if not source.is_dir():
+        return []
+
+    mounts: list[tuple[Path, str]] = []
+
+    for entry in sorted(source.iterdir()):
+        if entry.name in GLOBAL_CONFIG_EXCLUDED:
+            continue
+
+        if entry.is_dir() or entry.name in GLOBAL_CONFIG_FILES:
+            mounts.append(
+                (entry, f"{GLOBAL_CONFIG_PATH}/{entry.name}")
+            )
+
+    return mounts
+
+
+def container_entrypoint(container_command: list[str]) -> list[str]:
+    """
+    Wrap the container command so the shared credential is linked into place.
+
+    A wrapper rather than an image ENTRYPOINT, because projects may supply
+    their own Containerfile.dev and those images would not carry one.
+
+    OpenCode may replace the symlink with a real file if it writes the
+    credential atomically, so a login performed in one box is copied back into
+    the shared volume on the next start instead of being stranded.
+    """
+
+    credential = f"{OPENCODE_DATA_PATH}/{SHARED_CREDENTIAL}"
+    shared = f"{SHARED_DATA_PATH}/{SHARED_CREDENTIAL}"
+
+    script = (
+        f'mkdir -p "{OPENCODE_DATA_PATH}" "{SHARED_DATA_PATH}"\n'
+        f'if [ -f "{credential}" ] && [ ! -L "{credential}" ]; then\n'
+        f'  cp -f "{credential}" "{shared}"\n'
+        f'fi\n'
+        f'ln -sfn "{shared}" "{credential}"\n'
+        f'exec {shlex.join(container_command)}\n'
+    )
+
+    return ["bash", "-lc", script]
+
+
 def podman_run_command(
     root: Path,
     container_command: list[str],
@@ -456,12 +558,14 @@ def podman_run_command(
     kind: str,
     session: str,
     network: str,
+    home: Path | None = None,
 ) -> list[str]:
     uid = os.getuid()
     gid = os.getgid()
 
+    home = home or Path.home()
     runtime_dir = f"/run/user/{uid}"
-    agents_dir = Path.home() / ".agents"
+    agents_dir = home / ".agents"
 
     command = [
         "podman",
@@ -470,6 +574,8 @@ def podman_run_command(
         "--interactive",
         "--tty",
         "--init",
+        "--label",
+        f"{PROJECT_PATH_LABEL}={root}",
         "--name",
         container_name(root, kind, session),
         "--hostname",
@@ -501,20 +607,85 @@ def podman_run_command(
         f"XDG_RUNTIME_DIR={runtime_dir}",
     ]
 
+    for volume, destination in SHARED_VOLUME_MOUNTS:
+        command.extend(
+            [
+                "--volume",
+                f"{volume}:{destination}:rw,U",
+            ]
+        )
+
     command.extend(git_identity_env(root))
 
+    # Host directories are read by every box at once, so they take the shared
+    # SELinux label. The private label would let each new container revoke the
+    # others' access.
     if agents_dir.is_dir():
         command.extend(
             [
                 "--volume",
-                f"{agents_dir}:{AGENT_HOME}/.agents:ro,Z",
+                f"{agents_dir}:{AGENT_HOME}/.agents:ro,z",
+            ]
+        )
+
+    for source, destination in global_config_mounts(
+        home / ".config" / "opencode"
+    ):
+        command.extend(
+            [
+                "--volume",
+                f"{source}:{destination}:ro,z",
             ]
         )
 
     command.append(image_name(root))
-    command.extend(container_command)
+    command.extend(container_entrypoint(container_command))
 
     return command
+
+
+def volume_exists(name: str) -> bool:
+    result = run(
+        ["podman", "volume", "exists", name],
+        check=False,
+    )
+
+    return result.returncode == 0
+
+
+def ensure_volume(
+    name: str,
+    *,
+    labels: dict[str, str] | None = None,
+) -> None:
+    """
+    Create a volume up front so it carries labels.
+
+    Volumes created implicitly by `podman run` have none, which leaves them
+    unattributable during a clean sweep.
+    """
+
+    if volume_exists(name):
+        return
+
+    command = ["podman", "volume", "create"]
+
+    for key, value in (labels or {}).items():
+        command.extend(["--label", f"{key}={value}"])
+
+    command.append(name)
+
+    run(command, capture=True)
+
+
+def ensure_volumes(root: Path) -> None:
+    ensure_volume(
+        home_volume_name(root),
+        labels={PROJECT_PATH_LABEL: str(root)},
+    )
+
+    for name in SHARED_VOLUMES:
+        ensure_volume(name)
 
 
 def start_container(
@@ -525,6 +696,8 @@ def start_container(
     session: str,
     network: str = "slirp4netns",
 ) -> None:
+    ensure_volumes(root)
+
     command = podman_run_command(
         root,
         container_command,
@@ -648,57 +821,80 @@ def command_status(
         print(f"No containers for this project: {prefix}")
 
 
-def project_containers(root: Path) -> list[str]:
-    prefix = f"agentbox-{project_key(root)}"
-
-    result = run(
-        [
-            "podman",
-            "ps",
-            "--all",
-            "--format",
-            "{{.Names}}",
-        ],
-        capture=True,
-        check=False,
-    )
-
-    if result.returncode != 0:
-        return []
-
-    return [
-        name
-        for name in result.stdout.splitlines()
-        if name.startswith(prefix)
-    ]
-
-
-def project_images(root: Path) -> list[str]:
-    repo_prefix = f"localhost/agentbox-{project_key(root)}"
-
-    result = run(
-        [
-            "podman",
-            "images",
-            "--all",
-            "--format",
-            "json",
-        ],
-        capture=True,
-        check=False,
-    )
-
-    if result.returncode != 0:
-        return []
-
+def load_entries(payload: str) -> list[dict]:
     try:
-        entries = json.loads(result.stdout)
+        entries = json.loads(payload)
     except json.JSONDecodeError:
         return []
 
-    matches: list[str] = []
+    if not isinstance(entries, list):
+        return []
 
-    for entry in entries:
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def entry_label(entry: dict, label: str) -> str | None:
+    labels = entry.get("Labels") or entry.get("labels") or {}
+
+    if not isinstance(labels, dict):
+        return None
+
+    value = labels.get(label)
+
+    return value or None
+
+
+def parse_container_entries(payload: str) -> list[Resource]:
+    resources: list[Resource] = []
+
+    for entry in load_entries(payload):
+        names = entry.get("Names") or entry.get("names") or []
+
+        for name in names:
+            if not name.startswith(RESOURCE_PREFIX):
+                continue
+
+            resources.append(
+                Resource(
+                    kind="container",
+                    name=name,
+                    identifier=name,
+                    project_path=entry_label(entry, PROJECT_PATH_LABEL),
+                )
+            )
+
+    return resources
+
+
+def parse_volume_entries(payload: str) -> list[Resource]:
+    resources: list[Resource] = []
+
+    for entry in load_entries(payload):
+        name = entry.get("Name") or entry.get("name")
+
+        if not name or not name.startswith(RESOURCE_PREFIX):
+            continue
+
+        resources.append(
+            Resource(
+                kind="volume",
+                name=name,
+                identifier=name,
+                project_path=entry_label(entry, PROJECT_PATH_LABEL),
+                shared=name in SHARED_VOLUMES,
+            )
+        )
+
+    return resources
+
+
+def parse_image_entries(payload: str) -> list[Resource]:
+    resources: list[Resource] = []
+
+    # An image with several tags is listed once per tag.
+    seen: set[str] = set()
+
+    for entry in load_entries(payload):
         names = (
             entry.get("Names")
             or entry.get("names")
@@ -707,111 +903,311 @@ def project_images(root: Path) -> list[str]:
             or []
         )
 
-        if not any(
-            name == repo_prefix
-            or name.startswith(f"{repo_prefix}:")
-            for name in names
-        ):
+        match = next(
+            (name for name in names if name.startswith(IMAGE_PREFIX)),
+            None,
+        )
+
+        if match is None:
             continue
 
         image_id = (
-            entry.get("ID")
+            entry.get("Id")
+            or entry.get("ID")
             or entry.get("id")
         )
 
-        if image_id and image_id not in matches:
-            matches.append(image_id)
+        if not image_id or image_id in seen:
+            continue
 
-    return matches
+        seen.add(image_id)
+
+        resources.append(
+            Resource(
+                kind="image",
+                name=match,
+                identifier=image_id,
+                project_path=entry_label(entry, PROJECT_PATH_LABEL),
+            )
+        )
+
+    return resources
 
 
-def volume_exists(name: str) -> bool:
-    result = run(
-        ["podman", "volume", "exists", name],
-        check=False,
+def classify_resources(
+    resources: list[Resource],
+    *,
+    directory_exists: Callable[[str], bool],
+) -> dict[str, list[Resource]]:
+    """
+    Sort resources by whether the project they belong to still exists.
+
+    Shared volumes and resources created before project-path labels existed
+    cannot be attributed to a project, so they are reported as unknown and
+    only removed by --all.
+    """
+
+    groups: dict[str, list[Resource]] = {
+        "live": [],
+        "dangling": [],
+        "unknown": [],
+    }
+
+    for resource in resources:
+        if resource.shared or resource.project_path is None:
+            groups["unknown"].append(resource)
+        elif directory_exists(resource.project_path):
+            groups["live"].append(resource)
+        else:
+            groups["dangling"].append(resource)
+
+    return groups
+
+
+def select_for_removal(
+    groups: dict[str, list[Resource]],
+    *,
+    all_resources: bool,
+) -> list[Resource]:
+    if all_resources:
+        return [
+            resource
+            for key in ("live", "dangling", "unknown")
+            for resource in groups.get(key, [])
+        ]
+
+    return list(groups.get("dangling", []))
+
+
+def podman_json(command: list[str]) -> str:
+    result = run(command, capture=True, check=False)
+
+    if result.returncode != 0:
+        return ""
+
+    return result.stdout
+
+
+def discover_resources() -> list[Resource]:
+    containers = parse_container_entries(
+        podman_json(
+            ["podman", "ps", "--all", "--format", "json"]
+        )
     )
 
-    return result.returncode == 0
+    volumes = parse_volume_entries(
+        podman_json(
+            ["podman", "volume", "ls", "--format", "json"]
+        )
+    )
+
+    images = parse_image_entries(
+        podman_json(
+            ["podman", "images", "--all", "--format", "json"]
+        )
+    )
+
+    return [*containers, *volumes, *images]
 
 
-def command_clean(
-    args: argparse.Namespace,
-    root: Path,
-) -> None:
+def project_containers(root: Path) -> list[str]:
+    prefix = f"{RESOURCE_PREFIX}{project_key(root)}"
+
+    return [
+        resource.name
+        for resource in parse_container_entries(
+            podman_json(
+                ["podman", "ps", "--all", "--format", "json"]
+            )
+        )
+        if resource.name.startswith(prefix)
+    ]
+
+
+def project_images(root: Path) -> list[str]:
+    prefix = f"{IMAGE_PREFIX}{project_key(root)}"
+
+    identifiers: list[str] = []
+
+    for resource in parse_image_entries(
+        podman_json(
+            ["podman", "images", "--all", "--format", "json"]
+        )
+    ):
+        if not resource.name.startswith(prefix):
+            continue
+
+        if resource.identifier not in identifiers:
+            identifiers.append(resource.identifier)
+
+    return identifiers
+
+
+def confirm(prompt: str, *, assume_yes: bool) -> bool:
+    if assume_yes:
+        return True
+
+    answer = input(f"{prompt} [y/N] ").strip().lower()
+
+    if answer in ("y", "yes"):
+        return True
+
+    print("Aborted.")
+
+    return False
+
+
+REMOVE_COMMANDS = {
+    "container": ["podman", "rm", "--force"],
+    "volume": ["podman", "volume", "rm", "--force"],
+    "image": ["podman", "image", "rm", "--force"],
+}
+
+
+def remove_resources(resources: list[Resource]) -> None:
+    # Containers first: a volume or image still in use cannot be removed.
+    order = {"container": 0, "volume": 1, "image": 2}
+
+    for resource in sorted(resources, key=lambda item: order[item.kind]):
+        run(
+            [*REMOVE_COMMANDS[resource.kind], resource.identifier],
+            capture=True,
+            check=False,
+        )
+
+
+def describe_resources(resources: list[Resource]) -> None:
+    for kind in ("container", "volume", "image"):
+        names = [
+            resource.name
+            for resource in resources
+            if resource.kind == kind
+        ]
+
+        if names:
+            print(f"  {len(names)} {kind}(s): " + ", ".join(names))
+
+
+def clean_project(root: Path, *, assume_yes: bool) -> None:
     containers = project_containers(root)
     images = project_images(root)
     volume = home_volume_name(root)
 
-    if not containers and not images and not volume_exists(volume):
+    resources = [
+        Resource(
+            kind="container",
+            name=name,
+            identifier=name,
+            project_path=str(root),
+        )
+        for name in containers
+    ]
+
+    if volume_exists(volume):
+        resources.append(
+            Resource(
+                kind="volume",
+                name=volume,
+                identifier=volume,
+                project_path=str(root),
+            )
+        )
+
+    resources.extend(
+        Resource(
+            kind="image",
+            name=identifier,
+            identifier=identifier,
+            project_path=str(root),
+        )
+        for identifier in images
+    )
+
+    if not resources:
         print("Nothing to clean for this project.")
         return
 
-    details = []
-
-    if containers:
-        details.append(
-            f"{len(containers)} container(s): "
-            + ", ".join(containers)
-        )
-
-    if images:
-        details.append(
-            f"{len(images)} image(s): "
-            + ", ".join(images)
-        )
-
-    if volume_exists(volume):
-        details.append(f"volume: {volume}")
-
     print("Will remove:")
-    for detail in details:
-        print(f"  {detail}")
+    describe_resources(resources)
 
-    if not args.yes:
-        answer = input("Continue? [y/N] ").strip().lower()
+    if not confirm("Continue?", assume_yes=assume_yes):
+        return
 
-        if answer not in ("y", "yes"):
-            print("Aborted.")
-            return
-
-    for name in containers:
-        run(
-            [
-                "podman",
-                "rm",
-                "--force",
-                name,
-            ],
-            check=False,
-        )
-
-    for image_id in images:
-        run(
-            [
-                "podman",
-                "image",
-                "rm",
-                "--force",
-                image_id,
-            ],
-            check=False,
-        )
-
-    run(
-        [
-            "podman",
-            "volume",
-            "rm",
-            "--force",
-            volume,
-        ],
-        check=False,
-    )
+    remove_resources(resources)
 
     print(
         "Removed project containers, images, "
         "and persistent agent home."
     )
+
+
+def clean_sweep(*, all_resources: bool, assume_yes: bool) -> None:
+    groups = classify_resources(
+        discover_resources(),
+        directory_exists=lambda path: Path(path).is_dir(),
+    )
+
+    selected = select_for_removal(groups, all_resources=all_resources)
+
+    if not selected:
+        if all_resources:
+            print("No agentbox resources found.")
+        else:
+            print("No dangling agentbox resources found.")
+            report_unknown(groups)
+
+        return
+
+    if all_resources:
+        print("Will remove every agentbox resource:")
+    else:
+        print("Will remove resources for deleted directories:")
+
+    describe_resources(selected)
+
+    if all_resources and any(
+        resource.shared for resource in selected
+    ):
+        print(
+            "  (this includes the shared OpenCode login; "
+            "you will need to run 'agentbox auth' again)"
+        )
+
+    if not confirm("Continue?", assume_yes=assume_yes):
+        return
+
+    remove_resources(selected)
+
+    print(f"Removed {len(selected)} resource(s).")
+
+    if not all_resources:
+        report_unknown(groups)
+
+
+def report_unknown(groups: dict[str, list[Resource]]) -> None:
+    unlabeled = [
+        resource
+        for resource in groups.get("unknown", [])
+        if not resource.shared
+    ]
+
+    if unlabeled:
+        print(
+            f"{len(unlabeled)} resource(s) predate project tracking "
+            "and cannot be attributed; use --all to remove them."
+        )
+
+
+def command_clean(args: argparse.Namespace) -> None:
+    if args.project_only:
+        root = find_project_root(
+            args.project.expanduser().resolve()
+        )
+
+        clean_project(root, assume_yes=args.yes)
+        return
+
+    clean_sweep(all_resources=args.all, assume_yes=args.yes)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -934,8 +1330,29 @@ def build_parser() -> argparse.ArgumentParser:
     clean_parser = subparsers.add_parser(
         "clean",
         help=(
-            "Delete the project's containers, images, "
-            "and persistent agent home."
+            "Delete containers, images, and agent homes "
+            "left behind by deleted directories."
+        ),
+    )
+
+    clean_scope = clean_parser.add_mutually_exclusive_group()
+
+    clean_scope.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Remove every agentbox resource, including "
+            "live projects and the shared OpenCode login."
+        ),
+    )
+
+    clean_scope.add_argument(
+        "--project",
+        dest="project_only",
+        action="store_true",
+        help=(
+            "Remove only this project's containers, "
+            "image, and persistent agent home."
         ),
     )
 
@@ -974,6 +1391,12 @@ def main() -> int:
         if args.command is None:
             apply_default_run_arguments(args)
 
+        # `clean` sweeps across projects, so it must run from anywhere. Every
+        # other command needs a project root.
+        if args.command == "clean":
+            command_clean(args)
+            return 0
+
         root = find_project_root(
             args.project.expanduser().resolve()
         )
@@ -988,8 +1411,6 @@ def main() -> int:
             command_build(args, root)
         elif args.command == "status":
             command_status(args, root)
-        elif args.command == "clean":
-            command_clean(args, root)
         else:
             parser.error(
                 f"Unknown command: {args.command}"
