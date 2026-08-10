@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -37,7 +38,7 @@ class ParseContainersTest(unittest.TestCase):
         ]
         """
 
-        resources = agentbox.parse_container_entries(payload)
+        resources = agentbox.parse_container_entries(json.loads(payload))
 
         self.assertEqual(len(resources), 1)
         self.assertEqual(resources[0].kind, "container")
@@ -52,7 +53,7 @@ class ParseContainersTest(unittest.TestCase):
         ]
         """
 
-        resources = agentbox.parse_container_entries(payload)
+        resources = agentbox.parse_container_entries(json.loads(payload))
 
         self.assertEqual(
             [resource.name for resource in resources],
@@ -62,19 +63,16 @@ class ParseContainersTest(unittest.TestCase):
     def test_unlabeled_container_has_no_project_path(self):
         payload = '[{"Names": ["agentbox-app-abc123-shell-1"], "Labels": {}}]'
 
-        resources = agentbox.parse_container_entries(payload)
+        resources = agentbox.parse_container_entries(json.loads(payload))
 
         self.assertIsNone(resources[0].project_path)
 
     def test_tolerates_missing_labels_key(self):
         payload = '[{"Names": ["agentbox-app-abc123-shell-1"]}]'
 
-        resources = agentbox.parse_container_entries(payload)
+        resources = agentbox.parse_container_entries(json.loads(payload))
 
         self.assertIsNone(resources[0].project_path)
-
-    def test_returns_nothing_for_unparseable_payload(self):
-        self.assertEqual(agentbox.parse_container_entries("not json"), [])
 
 
 class ParseVolumesTest(unittest.TestCase):
@@ -88,7 +86,7 @@ class ParseVolumesTest(unittest.TestCase):
         ]
         """
 
-        resources = agentbox.parse_volume_entries(payload)
+        resources = agentbox.parse_volume_entries(json.loads(payload))
 
         self.assertEqual(resources[0].kind, "volume")
         self.assertEqual(resources[0].project_path, "/home/u/app")
@@ -101,7 +99,7 @@ class ParseVolumesTest(unittest.TestCase):
         ]
         """
 
-        resources = agentbox.parse_volume_entries(payload)
+        resources = agentbox.parse_volume_entries(json.loads(payload))
         shared = {
             resource.name: resource.shared for resource in resources
         }
@@ -127,7 +125,7 @@ class ParseImagesTest(unittest.TestCase):
         ]
         """
 
-        resources = agentbox.parse_image_entries(payload)
+        resources = agentbox.parse_image_entries(json.loads(payload))
 
         self.assertEqual(resources[0].kind, "image")
         self.assertEqual(resources[0].identifier, "sha256:deadbeef")
@@ -142,7 +140,7 @@ class ParseImagesTest(unittest.TestCase):
         ]
         """
 
-        resources = agentbox.parse_image_entries(payload)
+        resources = agentbox.parse_image_entries(json.loads(payload))
 
         self.assertEqual(
             [resource.identifier for resource in resources],
@@ -162,7 +160,7 @@ class ParseImagesTest(unittest.TestCase):
           }
         """
 
-        resources = agentbox.parse_image_entries(f"[{entry},{entry}]")
+        resources = agentbox.parse_image_entries(json.loads(f"[{entry},{entry}]"))
 
         self.assertEqual([r.identifier for r in resources], ["sha256:same"])
 
@@ -173,10 +171,10 @@ class ParseImagesTest(unittest.TestCase):
         ]
         """
 
-        self.assertEqual(agentbox.parse_image_entries(payload), [])
+        self.assertEqual(agentbox.parse_image_entries(json.loads(payload)), [])
 
 
-class ClassifyResourcesTest(unittest.TestCase):
+class SelectForRemovalTest(unittest.TestCase):
     def resource(self, name, project_path, *, shared=False):
         return agentbox.Resource(
             kind="volume",
@@ -186,88 +184,56 @@ class ClassifyResourcesTest(unittest.TestCase):
             shared=shared,
         )
 
-    def test_labeled_resource_with_existing_directory_is_live(self):
-        groups = agentbox.classify_resources(
-            [self.resource("a", "/home/u/app")],
-            directory_exists=lambda path: True,
-        )
+    def select(self, resources, *, all_resources=False, existing=()):
+        return [
+            resource.name
+            for resource in agentbox.select_for_removal(
+                resources,
+                all_resources=all_resources,
+                directory_exists=lambda path: path in existing,
+            )
+        ]
 
-        self.assertEqual([r.name for r in groups["live"]], ["a"])
-        self.assertEqual(groups["dangling"], [])
-        self.assertEqual(groups["unknown"], [])
+    def test_keeps_a_resource_whose_directory_still_exists(self):
+        resources = [self.resource("a", "/home/u/app")]
 
-    def test_labeled_resource_with_missing_directory_is_dangling(self):
-        groups = agentbox.classify_resources(
-            [self.resource("a", "/home/u/gone")],
-            directory_exists=lambda path: False,
-        )
+        self.assertEqual(self.select(resources, existing={"/home/u/app"}), [])
 
-        self.assertEqual([r.name for r in groups["dangling"]], ["a"])
-        self.assertEqual(groups["live"], [])
+    def test_removes_a_resource_whose_directory_is_gone(self):
+        resources = [self.resource("a", "/home/u/gone")]
 
-    def test_unlabeled_resource_is_unknown(self):
-        groups = agentbox.classify_resources(
-            [self.resource("a", None)],
-            directory_exists=lambda path: False,
-        )
+        self.assertEqual(self.select(resources), ["a"])
 
-        self.assertEqual([r.name for r in groups["unknown"]], ["a"])
-        self.assertEqual(groups["dangling"], [])
+    def test_keeps_an_unlabeled_resource(self):
+        """Without a project path there is no directory to check."""
 
-    def test_shared_volume_is_unknown_even_when_labeled(self):
-        groups = agentbox.classify_resources(
-            [self.resource("agentbox-shared-data", "/home/u/app", shared=True)],
-            directory_exists=lambda path: False,
-        )
+        self.assertEqual(self.select([self.resource("a", None)]), [])
 
-        self.assertEqual(
-            [r.name for r in groups["unknown"]],
-            ["agentbox-shared-data"],
-        )
+    def test_keeps_a_shared_volume_even_when_labeled(self):
+        resources = [self.resource("shared", "/home/u/gone", shared=True)]
 
-    def test_classifies_each_resource_against_its_own_directory(self):
-        existing = {"/home/u/app"}
+        self.assertEqual(self.select(resources), [])
 
-        groups = agentbox.classify_resources(
-            [
-                self.resource("live-one", "/home/u/app"),
-                self.resource("dead-one", "/home/u/gone"),
-            ],
-            directory_exists=lambda path: path in existing,
-        )
-
-        self.assertEqual([r.name for r in groups["live"]], ["live-one"])
-        self.assertEqual([r.name for r in groups["dangling"]], ["dead-one"])
-
-
-class SelectForRemovalTest(unittest.TestCase):
-    def setUp(self):
-        self.groups = {
-            "live": [self.resource("live-one")],
-            "dangling": [self.resource("dead-one")],
-            "unknown": [self.resource("mystery")],
-        }
-
-    def resource(self, name):
-        return agentbox.Resource(
-            kind="volume",
-            name=name,
-            identifier=name,
-            project_path=None,
-            shared=False,
-        )
-
-    def test_default_mode_removes_only_dangling(self):
-        selected = agentbox.select_for_removal(self.groups, all_resources=False)
-
-        self.assertEqual([r.name for r in selected], ["dead-one"])
-
-    def test_all_mode_removes_every_category(self):
-        selected = agentbox.select_for_removal(self.groups, all_resources=True)
+    def test_checks_each_resource_against_its_own_directory(self):
+        resources = [
+            self.resource("live-one", "/home/u/app"),
+            self.resource("dead-one", "/home/u/gone"),
+        ]
 
         self.assertEqual(
-            sorted(r.name for r in selected),
-            ["dead-one", "live-one", "mystery"],
+            self.select(resources, existing={"/home/u/app"}), ["dead-one"]
+        )
+
+    def test_all_mode_removes_everything_including_shared_state(self):
+        resources = [
+            self.resource("live-one", "/home/u/app"),
+            self.resource("dead-one", "/home/u/gone"),
+            self.resource("shared", None, shared=True),
+        ]
+
+        self.assertEqual(
+            self.select(resources, all_resources=True, existing={"/home/u/app"}),
+            ["live-one", "dead-one", "shared"],
         )
 
 
@@ -519,6 +485,99 @@ class PodmanRunUsesEntrypointTest(PodmanRunCommandTest):
     def test_container_command_is_wrapped(self):
         self.assertEqual(self.command[-3:-1], ["bash", "-lc"])
         self.assertTrue(self.command[-1].rstrip().endswith("exec opencode"))
+
+
+class ParseArgumentsTest(unittest.TestCase):
+    """A bare invocation must be `run` with every parser default applied."""
+
+    def test_bare_invocation_defaults_to_run(self):
+        args = agentbox.parse_arguments([])
+
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.kind, "opencode")
+        self.assertEqual(
+            args.container_command,
+            ["opencode", "--auto", agentbox.WORKSPACE_PATH],
+        )
+        self.assertFalse(args.rebuild)
+        self.assertFalse(args.no_snapshot)
+        self.assertIsNone(args.name)
+        self.assertEqual(args.network, "slirp4netns")
+        self.assertEqual(args.opencode_args, [])
+
+    def test_bare_invocation_keeps_global_options(self):
+        args = agentbox.parse_arguments(["--project", "/home/u/app"])
+
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.project, Path("/home/u/app"))
+
+    def test_auth_skips_the_snapshot(self):
+        self.assertFalse(agentbox.parse_arguments(["auth"]).snapshot)
+
+    def test_auth_does_not_disable_snapshots_for_other_commands(self):
+        """
+        `--no-snapshot` is one action object shared by every subparser, so a
+        per-subparser default for it would silently disable the recovery
+        snapshot everywhere.
+        """
+
+        for command in ("run", "shell", []):
+            arguments = [command] if command else []
+
+            with self.subTest(command=command or "<bare>"):
+                args = agentbox.parse_arguments(arguments)
+
+                self.assertTrue(args.snapshot)
+                self.assertFalse(args.no_snapshot)
+
+    def test_commands_without_a_project_root_are_not_session_commands(self):
+        self.assertNotIn("clean", agentbox.COMMANDS)
+
+
+class ProjectResourcesTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path("/home/u/app")
+        self.marker = f"agentbox-{agentbox.project_key(self.root)}"
+
+    def select(self, resources):
+        original = agentbox.discover_resources
+        agentbox.discover_resources = lambda: resources
+        self.addCleanup(setattr, agentbox, "discover_resources", original)
+
+        return [r.name for r in agentbox.project_resources(self.root)]
+
+    def resource(self, kind, name, project_path=None, *, shared=False):
+        return agentbox.Resource(
+            kind=kind,
+            name=name,
+            identifier=name,
+            project_path=project_path,
+            shared=shared,
+        )
+
+    def test_matches_containers_volumes_and_images_by_name(self):
+        resources = [
+            self.resource("container", f"{self.marker}-shell-1"),
+            self.resource("volume", f"{self.marker}-home"),
+            self.resource("image", f"localhost/{self.marker}:dev"),
+            self.resource("container", "agentbox-other-999-shell-1"),
+        ]
+
+        self.assertEqual(len(self.select(resources)), 3)
+
+    def test_matches_by_label_when_the_name_does_not_carry_the_key(self):
+        resources = [self.resource("volume", "agentbox-legacy", str(self.root))]
+
+        self.assertEqual(self.select(resources), ["agentbox-legacy"])
+
+    def test_never_includes_shared_state(self):
+        resources = [
+            self.resource(
+                "volume", agentbox.SHARED_VOLUME, str(self.root), shared=True
+            )
+        ]
+
+        self.assertEqual(self.select(resources), [])
 
 
 if __name__ == "__main__":
