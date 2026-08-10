@@ -291,6 +291,58 @@ def git_output(
     return result.stdout
 
 
+def git_config_value(root: Path, key: str) -> str | None:
+    result = run(
+        ["git", "config", "--get", key],
+        cwd=root,
+        capture=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        return None
+
+    value = result.stdout.strip()
+
+    return value or None
+
+
+def git_identity_env(root: Path) -> list[str]:
+    """
+    Expose the host Git identity to the container.
+
+    GIT_CONFIG_* entries are read by `git config --get` too, so the agent
+    sees the same user.name and user.email the host does.
+    """
+
+    entries = [
+        ("user.name", git_config_value(root, "user.name")),
+        ("user.email", git_config_value(root, "user.email")),
+    ]
+
+    entries = [
+        (key, value)
+        for key, value in entries
+        if value is not None
+    ]
+
+    if not entries:
+        return []
+
+    variables = [f"GIT_CONFIG_COUNT={len(entries)}"]
+
+    for index, (key, value) in enumerate(entries):
+        variables.append(f"GIT_CONFIG_KEY_{index}={key}")
+        variables.append(f"GIT_CONFIG_VALUE_{index}={value}")
+
+    arguments: list[str] = []
+
+    for variable in variables:
+        arguments.extend(["--env", variable])
+
+    return arguments
+
+
 def create_recovery_snapshot(root: Path) -> Path:
     """
     Save recoverable host-side Git state outside the mounted workspace.
@@ -448,6 +500,8 @@ def podman_run_command(
         "--env",
         f"XDG_RUNTIME_DIR={runtime_dir}",
     ]
+
+    command.extend(git_identity_env(root))
 
     if agents_dir.is_dir():
         command.extend(
