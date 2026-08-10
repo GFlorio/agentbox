@@ -32,27 +32,38 @@ RESOURCE_PREFIX = "agentbox-"
 IMAGE_PREFIX = "localhost/agentbox-"
 
 # OpenCode keeps credentials in its data directory and the selected model in
-# its state directory. Both are shared by every project so that a single
-# `agentbox auth` covers all worktrees.
-SHARED_DATA_VOLUME = "agentbox-shared-data"
-SHARED_STATE_VOLUME = "agentbox-shared-state"
-SHARED_VOLUMES = (SHARED_DATA_VOLUME, SHARED_STATE_VOLUME)
+# its state directory. Both files are shared by every project so that a single
+# `agentbox auth` and model choice cover all worktrees.
+SHARED_VOLUME = "agentbox-shared"
+SHARED_VOLUMES = (SHARED_VOLUME,)
 
 OPENCODE_DATA_PATH = f"{AGENT_HOME}/.local/share/opencode"
 OPENCODE_STATE_PATH = f"{AGENT_HOME}/.local/state/opencode"
 
-# The credential is shared through a neutral mount point rather than by
-# mounting over the data directory, which would also share opencode.db and
-# make session history common to every worktree.
-SHARED_DATA_PATH = f"{AGENT_HOME}/.agentbox/shared"
-SHARED_CREDENTIAL = "auth.json"
+# Mounted one level below the agent home, and never deeper. Podman creates
+# missing intermediate mountpoints as root inside the home volume, and those
+# directories are not overlaid by anything, so their parents become unwritable
+# by the agent. A single-level mountpoint is the volume itself, which the U
+# flag chowns to the agent.
+#
+# Individual files are linked out of it rather than mounting over the OpenCode
+# directories, which would also share opencode.db and make session history
+# common to every worktree.
+SHARED_PATH = f"{AGENT_HOME}/.agentbox-shared"
 
-SHARED_VOLUME_MOUNTS = (
-    (SHARED_DATA_VOLUME, SHARED_DATA_PATH),
-    (SHARED_STATE_VOLUME, OPENCODE_STATE_PATH),
+SHARED_LINKS = (
+    (OPENCODE_DATA_PATH, "auth.json"),
+    (OPENCODE_STATE_PATH, "model.json"),
 )
 
+SHARED_VOLUME_MOUNTS = ((SHARED_VOLUME, SHARED_PATH),)
+
 GLOBAL_CONFIG_PATH = f"{AGENT_HOME}/.config/opencode"
+
+# The host config directory is mounted whole, one level below the agent home
+# for the reason given above, and its entries are linked into the path OpenCode
+# reads. opencode.jsonc is present here but never linked.
+GLOBAL_CONFIG_MOUNT = f"{AGENT_HOME}/.agentbox-config"
 
 # The box ships its own opencode.json; the host copy must not override it.
 GLOBAL_CONFIG_EXCLUDED = frozenset({"opencode.jsonc"})
@@ -499,56 +510,70 @@ def create_recovery_snapshot(root: Path) -> Path:
     return destination
 
 
-def global_config_mounts(source: Path) -> list[tuple[Path, str]]:
+def global_config_entries(source: Path) -> list[str]:
     """
-    Host paths under ~/.config/opencode to expose read-only in the box.
+    Entries of ~/.config/opencode to expose in the box.
 
-    Every subdirectory is mounted, so global agents, skills, plugins, commands,
-    and themes work without agentbox knowing OpenCode's directory names.
+    Every subdirectory is included, so global agents, skills, plugins,
+    commands, and themes work without agentbox knowing OpenCode's directory
+    names.
     """
 
     if not source.is_dir():
         return []
 
-    mounts: list[tuple[Path, str]] = []
-
-    for entry in sorted(source.iterdir()):
-        if entry.name in GLOBAL_CONFIG_EXCLUDED:
-            continue
-
-        if entry.is_dir() or entry.name in GLOBAL_CONFIG_FILES:
-            mounts.append(
-                (entry, f"{GLOBAL_CONFIG_PATH}/{entry.name}")
-            )
-
-    return mounts
+    return [
+        entry.name
+        for entry in sorted(source.iterdir())
+        if entry.name not in GLOBAL_CONFIG_EXCLUDED
+        and (entry.is_dir() or entry.name in GLOBAL_CONFIG_FILES)
+    ]
 
 
-def container_entrypoint(container_command: list[str]) -> list[str]:
+def container_entrypoint(
+    container_command: list[str],
+    *,
+    config_entries: list[str] | None = None,
+) -> list[str]:
     """
-    Wrap the container command so the shared credential is linked into place.
+    Wrap the container command so shared OpenCode files are linked into place.
 
     A wrapper rather than an image ENTRYPOINT, because projects may supply
     their own Containerfile.dev and those images would not carry one.
 
-    OpenCode may replace the symlink with a real file if it writes the
-    credential atomically, so a login performed in one box is copied back into
-    the shared volume on the next start instead of being stranded.
+    OpenCode may replace a symlink with a real file if it writes atomically, so
+    a login or model choice made in one box is copied back into the shared
+    volume on the next start instead of being stranded.
     """
 
-    credential = f"{OPENCODE_DATA_PATH}/{SHARED_CREDENTIAL}"
-    shared = f"{SHARED_DATA_PATH}/{SHARED_CREDENTIAL}"
+    lines: list[str] = []
 
-    script = (
-        f'mkdir -p "{OPENCODE_DATA_PATH}" "{SHARED_DATA_PATH}"\n'
-        f'if [ -f "{credential}" ] && [ ! -L "{credential}" ]; then\n'
-        f'  cp -f "{credential}" "{shared}"\n'
-        f'fi\n'
-        f'ln -sfn "{shared}" "{credential}"\n'
-        f'exec {shlex.join(container_command)}\n'
-    )
+    for directory, filename in SHARED_LINKS:
+        local = f"{directory}/{filename}"
+        shared = f"{SHARED_PATH}/{filename}"
 
-    return ["bash", "-lc", script]
+        lines.extend(
+            [
+                f'mkdir -p "{directory}"',
+                f'if [ -f "{local}" ] && [ ! -L "{local}" ]; then',
+                f'  cp -f "{local}" "{shared}"',
+                "fi",
+                f'ln -sfn "{shared}" "{local}"',
+            ]
+        )
+
+    if config_entries:
+        lines.append(f'mkdir -p "{GLOBAL_CONFIG_PATH}"')
+
+        for name in config_entries:
+            lines.append(
+                f'ln -sfn "{GLOBAL_CONFIG_MOUNT}/{name}" '
+                f'"{GLOBAL_CONFIG_PATH}/{name}"'
+            )
+
+    lines.append(f"exec {shlex.join(container_command)}")
+
+    return ["bash", "-lc", "\n".join(lines) + "\n"]
 
 
 def podman_run_command(
@@ -628,18 +653,24 @@ def podman_run_command(
             ]
         )
 
-    for source, destination in global_config_mounts(
-        home / ".config" / "opencode"
-    ):
+    config_source = home / ".config" / "opencode"
+    config_entries = global_config_entries(config_source)
+
+    if config_entries:
         command.extend(
             [
                 "--volume",
-                f"{source}:{destination}:ro,z",
+                f"{config_source}:{GLOBAL_CONFIG_MOUNT}:ro,z",
             ]
         )
 
     command.append(image_name(root))
-    command.extend(container_entrypoint(container_command))
+    command.extend(
+        container_entrypoint(
+            container_command,
+            config_entries=config_entries,
+        )
+    )
 
     return command
 

@@ -96,8 +96,7 @@ class ParseVolumesTest(unittest.TestCase):
     def test_marks_shared_volumes_as_shared(self):
         payload = """
         [
-          {"Name": "agentbox-shared-data", "Labels": {}},
-          {"Name": "agentbox-shared-state", "Labels": {}},
+          {"Name": "agentbox-shared", "Labels": {}},
           {"Name": "agentbox-app-abc123-home", "Labels": {}}
         ]
         """
@@ -110,8 +109,7 @@ class ParseVolumesTest(unittest.TestCase):
         self.assertEqual(
             shared,
             {
-                "agentbox-shared-data": True,
-                "agentbox-shared-state": True,
+                "agentbox-shared": True,
                 "agentbox-app-abc123-home": False,
             },
         )
@@ -281,53 +279,41 @@ class GlobalConfigMountsTest(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.source = Path(self.temporary.name)
 
-    def mounts(self):
-        return agentbox.global_config_mounts(self.source)
+    def entries(self):
+        return agentbox.global_config_entries(self.source)
 
     def test_returns_nothing_when_the_directory_is_absent(self):
         self.assertEqual(
-            agentbox.global_config_mounts(self.source / "missing"),
+            agentbox.global_config_entries(self.source / "missing"),
             [],
         )
 
-    def test_mounts_every_subdirectory(self):
+    def test_includes_every_subdirectory(self):
         (self.source / "agents").mkdir()
         (self.source / "skills").mkdir()
 
-        self.assertEqual(
-            [container for _, container in self.mounts()],
-            [
-                f"{agentbox.AGENT_HOME}/.config/opencode/agents",
-                f"{agentbox.AGENT_HOME}/.config/opencode/skills",
-            ],
-        )
+        self.assertEqual(self.entries(), ["agents", "skills"])
 
-    def test_mounts_node_modules_so_global_plugins_resolve(self):
+    def test_includes_node_modules_so_global_plugins_resolve(self):
         (self.source / "node_modules").mkdir()
 
-        self.assertEqual(
-            [container for _, container in self.mounts()],
-            [f"{agentbox.AGENT_HOME}/.config/opencode/node_modules"],
-        )
+        self.assertEqual(self.entries(), ["node_modules"])
 
-    def test_mounts_package_json(self):
+    def test_includes_package_json(self):
         (self.source / "package.json").write_text("{}", encoding="utf-8")
 
-        self.assertEqual(
-            [container for _, container in self.mounts()],
-            [f"{agentbox.AGENT_HOME}/.config/opencode/package.json"],
-        )
+        self.assertEqual(self.entries(), ["package.json"])
 
     def test_excludes_host_opencode_config(self):
         (self.source / "opencode.jsonc").write_text("{}", encoding="utf-8")
 
-        self.assertEqual(self.mounts(), [])
+        self.assertEqual(self.entries(), [])
 
     def test_excludes_unrelated_top_level_files(self):
         (self.source / "package-lock.json").write_text("{}", encoding="utf-8")
         (self.source / ".gitignore").write_text("x", encoding="utf-8")
 
-        self.assertEqual(self.mounts(), [])
+        self.assertEqual(self.entries(), [])
 
 
 class PodmanRunCommandTest(unittest.TestCase):
@@ -340,7 +326,7 @@ class PodmanRunCommandTest(unittest.TestCase):
         self.root = Path(self.temporary.name) / "app"
         self.root.mkdir()
 
-        home = Path(self.temporary.name) / "home"
+        self.home = home = Path(self.temporary.name) / "home"
         (home / ".agents").mkdir(parents=True)
         (home / ".config" / "opencode" / "skills").mkdir(parents=True)
 
@@ -360,33 +346,55 @@ class PodmanRunCommandTest(unittest.TestCase):
             if item == "--volume"
         ]
 
+    def mount_destinations(self):
+        return [
+            argument.split(":")[1]
+            for argument in self.volume_arguments()
+        ]
+
     def test_labels_the_container_with_the_project_path(self):
         self.assertIn(
             f"{agentbox.PROJECT_PATH_LABEL}={self.root}",
             self.command,
         )
 
-    def test_mounts_the_shared_data_volume_at_a_neutral_path(self):
+    def test_mounts_the_shared_volume_at_a_neutral_path(self):
         self.assertIn(
-            f"{agentbox.SHARED_DATA_VOLUME}:"
-            f"{agentbox.SHARED_DATA_PATH}:rw,U",
+            f"{agentbox.SHARED_VOLUME}:{agentbox.SHARED_PATH}:rw,U",
             self.volume_arguments(),
         )
 
     def test_does_not_mount_over_the_opencode_data_directory(self):
         """Session history must stay in the per-project agent home."""
 
-        destinations = [
-            argument.split(":")[1]
-            for argument in self.volume_arguments()
-        ]
+        self.assertNotIn(
+            agentbox.OPENCODE_DATA_PATH,
+            self.mount_destinations(),
+        )
 
-        self.assertNotIn(agentbox.OPENCODE_DATA_PATH, destinations)
+    def test_never_mounts_below_the_agent_home(self):
+        """
+        Podman creates missing intermediate mountpoints as root inside the
+        home volume, which makes their parents unwritable by the agent. Every
+        mount under the home must therefore be exactly one level deep.
+        """
 
-    def test_mounts_the_shared_state_volume_over_opencode_state(self):
+        for destination in self.mount_destinations():
+            if not destination.startswith(f"{agentbox.AGENT_HOME}/"):
+                continue
+
+            relative = destination[len(agentbox.AGENT_HOME) + 1:]
+
+            self.assertNotIn(
+                "/",
+                relative,
+                f"{destination} would need a root-owned intermediate directory",
+            )
+
+    def test_mounts_the_host_config_directory_once(self):
         self.assertIn(
-            f"{agentbox.SHARED_STATE_VOLUME}:"
-            f"{agentbox.AGENT_HOME}/.local/state/opencode:rw,U",
+            f"{self.home}/.config/opencode:"
+            f"{agentbox.GLOBAL_CONFIG_MOUNT}:ro,z",
             self.volume_arguments(),
         )
 
@@ -416,8 +424,44 @@ class ContainerEntrypointTest(unittest.TestCase):
 
     def test_links_the_credential_into_the_shared_volume(self):
         self.assertIn(
-            f'ln -sfn "{agentbox.SHARED_DATA_PATH}/auth.json" '
+            f'ln -sfn "{agentbox.SHARED_PATH}/auth.json" '
             f'"{agentbox.OPENCODE_DATA_PATH}/auth.json"',
+            self.script(),
+        )
+
+    def test_links_the_selected_model_into_the_shared_volume(self):
+        self.assertIn(
+            f'ln -sfn "{agentbox.SHARED_PATH}/model.json" '
+            f'"{agentbox.OPENCODE_STATE_PATH}/model.json"',
+            self.script(),
+        )
+
+    def test_links_global_config_entries_into_place(self):
+        wrapped = agentbox.container_entrypoint(
+            ["opencode"],
+            config_entries=["agents", "package.json"],
+        )
+
+        for name in ("agents", "package.json"):
+            self.assertIn(
+                f'ln -sfn "{agentbox.GLOBAL_CONFIG_MOUNT}/{name}" '
+                f'"{agentbox.GLOBAL_CONFIG_PATH}/{name}"',
+                wrapped[2],
+            )
+
+    def test_creates_the_state_directory_it_links_into(self):
+        script = self.script()
+
+        self.assertIn(f'mkdir -p "{agentbox.OPENCODE_STATE_PATH}"', script)
+
+    def test_does_not_create_the_shared_mountpoint(self):
+        """
+        The shared path is a mount, already present and owned by the agent.
+        Creating it would mask a mount failure.
+        """
+
+        self.assertNotIn(
+            f'mkdir -p "{agentbox.SHARED_PATH}"',
             self.script(),
         )
 
@@ -445,11 +489,20 @@ class ContainerEntrypointTest(unittest.TestCase):
 
         self.assertIn(
             f'cp -f "{agentbox.OPENCODE_DATA_PATH}/auth.json" '
-            f'"{agentbox.SHARED_DATA_PATH}/auth.json"',
+            f'"{agentbox.SHARED_PATH}/auth.json"',
             script,
         )
         self.assertIn(
             f'[ ! -L "{agentbox.OPENCODE_DATA_PATH}/auth.json" ]',
+            script,
+        )
+
+    def test_rescues_a_model_written_over_the_symlink(self):
+        script = self.script()
+
+        self.assertIn(
+            f'cp -f "{agentbox.OPENCODE_STATE_PATH}/model.json" '
+            f'"{agentbox.SHARED_PATH}/model.json"',
             script,
         )
 
